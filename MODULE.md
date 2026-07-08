@@ -9,7 +9,9 @@ batch to listeners in queue order.
 
 | Assembly | Path | Notes |
 |---|---|---|
-| `PFound.Signaling` | `Runtime/PFound.Signaling.asmdef` | `autoReferenced: false`; references the engine only for the destroyed-owner check and the warning log |
+| `PFound.Signaling` | `Runtime/PFound.Signaling.asmdef` | `autoReferenced: false`; references the engine only for the destroyed-owner check, `[SerializeField]` on the key, and the diagnostic logs |
+| `PFound.Signaling.Editor` | `Editor/PFound.Signaling.Editor.asmdef` | Editor-only; a `SignalKey` property drawer that lists all `SignalBase`-derived types in a dropdown for inspector authoring |
+| `PFound.Signaling.Tests` | `Tests/PFound.Signaling.Tests.asmdef` | Standalone mono/csc runner (UnityEngine shims are `UNITY_5_3_OR_NEWER`-guarded so they never clash in-editor) |
 
 ## Dependencies
 - Engine only: `UnityEngine.Object` (destroyed-listener detection) and `Debug.LogWarning`.
@@ -29,17 +31,37 @@ batch to listeners in queue order.
 
 `SignalTracker`:
 ```csharp
-void AddListener<T>(Action<SignalKey> callback, int order = 0) where T : SignalBase;  // lower order runs first
+// by compile-time type
+void AddListener<T>(Action<SignalKey> callback, int order = 0) where T : SignalBase;          // lower order runs first
+void AddListener<T>(Action<SignalKey, UnityEngine.Object> callback, int order = 0) where T : SignalBase; // causer-aware
 void RemoveListener<T>(Action<SignalKey> callback) where T : SignalBase;
-void Queue<T>(UnityEngine.Object causer) where T : SignalBase;   // deduped per round; causer = diagnostics only, may be null
-bool EmitQueuedSignals();                                        // deliver everything queued, empty queue, return true if anything delivered
+void RemoveListener<T>(Action<SignalKey, UnityEngine.Object> callback) where T : SignalBase;
+void Queue<T>(UnityEngine.Object causer) where T : SignalBase;   // deduped per round; causer captured, may be null
+
+// by runtime / serialized key (no static type parameter — inspector-wireable)
+void AddListener(SignalKey key, Action<SignalKey> callback, int order = 0);
+void AddListener(SignalKey key, Action<SignalKey, UnityEngine.Object> callback, int order = 0);
+void RemoveListener(SignalKey key, Action<SignalKey> callback);
+void RemoveListener(SignalKey key, Action<SignalKey, UnityEngine.Object> callback);
+void Queue(SignalKey key, UnityEngine.Object causer);
+
+bool EmitQueuedSignals();     // deliver everything queued, empty queue, return true if anything delivered
+bool LogEmissions;            // when true, logs each emit with its causer (off by default)
+bool HasQueuedSignals { get; }
+int  ListenerCount(SignalKey key);
+int  TotalListenerCount { get; }
+int  Teardown();              // audit: logs + returns count of listeners still registered, then clears the bus
 ```
 
-`SignalKey`:
+Duplicate subscriptions (the same callback added twice for one key) are warned and skipped.
+
+`SignalKey` — `[Serializable]`, inspector-authorable via the editor dropdown:
 ```csharp
 static SignalKey Create<T>() where T : SignalBase;
-bool IsValid { get; }        // false for a default (uninitialized) key
-Type SignalType { get; }     // the signal's runtime type, or null for an invalid key
+static SignalKey FromType(Type signalType);   // signalType must derive from SignalBase
+bool IsValid { get; }        // false for a default (unauthored) key
+string TypeName { get; }     // serialized identity (assembly-qualified type name)
+Type SignalType { get; }     // the signal's runtime type, or null when unset / not loaded
 ```
 
 ## Model
@@ -89,9 +111,16 @@ Signaling/
   MODULE.md
   Runtime/
     PFound.Signaling.asmdef
-    SignalTracker.cs   # the bus: listeners, queue, deferred emit, re-entrancy + destroyed-owner guards
+    SignalTracker.cs   # the bus: listeners (type + by-key), queue w/ causer, deferred emit, dedupe, re-entrancy + destroyed-owner guards, teardown audit
     SignalBase.cs      # marker base for signal types
-    SignalKey.cs       # value-type signal identity
+    SignalKey.cs       # serializable signal identity (type name); usable by type or as a runtime/inspector key
+  Editor/
+    PFound.Signaling.Editor.asmdef
+    SignalKeyDrawer.cs # inspector dropdown of all SignalBase-derived types
+  Tests/
+    PFound.Signaling.Tests.asmdef
+    SignalTrackerTests.cs # standalone mono/csc suite (34 checks)
+    UnityStubs.cs         # UNITY_5_3_OR_NEWER-guarded UnityEngine shims for the mono build
 ```
 
 ## Downstream Dependents
@@ -110,6 +139,10 @@ Signaling/
 - **Needs an external pump.** Nothing ticks `EmitQueuedSignals()` for you; forget the driver and
   signals never deliver.
 - **Per-round dedupe.** Queuing the same type twice before a pump delivers it once — you cannot fire
-  the same signal N times within one round.
-- **`causer` is diagnostics only.** It is accepted for future diagnostics but not currently surfaced
-  to listeners or logged.
+  the same signal N times within one round. The first queue's `causer` wins.
+- **`causer` is diagnostics only.** It is captured per queued signal and surfaced two ways: passed to
+  causer-aware handlers (`Action<SignalKey, UnityEngine.Object>`), and logged on emit when
+  `LogEmissions` is enabled. It does not affect dispatch or dedupe.
+- **`SignalKey` identity is the assembly-qualified type name.** Stable for Unity player script
+  assemblies; a stored key whose type was renamed/removed resolves `SignalType` to null and shows as
+  `(missing)` in the dropdown rather than being silently wiped.
